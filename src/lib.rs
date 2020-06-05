@@ -3,33 +3,33 @@
 //! [C prussdrv library](https://github.com/beagleboard/am335x_pru_package)
 //! but with a safer, rustic API that attempts to mitigate risks related to uninitialized or
 //! invalid register states, use of freed memory, memory allocations conflicts etc.
-//! 
-//! 
+//!
+//!
 //! # Design rationale
-//! 
+//!
 //! The design of the library exploits the Rust type system to reduce the risk of shooting onself
 //! in the foot. Its architecture is meant to offer improved ergonomics compared to its C relative,
 //! while operating at a similarly low level of abstraction and providing equivalent functionality.
-//! 
+//!
 //! Data-race safety is warranted by checking that only one `Pruss` instance (a view of the PRU
 //! subsystem) is running at a time. The magic of the Rust borrowing rules will then _statically_
 //! ensure, inter alia:
-//! 
+//!
 //! * the absence of memory aliasing for local and shared PRU RAM, meaning that a previously allocated
 //! RAM segment may not be re-used before the data it contains is released,
-//! 
+//!
 //! * the impossibility to request code execution on a PRU core before the code has actually been
 //! loaded,
-//! 
+//!
 //! * the impossibility to overwrite PRU code that is already loaded and still in use,
-//! 
+//!
 //! * the impossibility to concurrently modify the interrupt mapping.
-//! 
+//!
 //! Type safety also avoids many pitfalls associated with interrupt management. Unlike the C prussdrv
 //! library, system events, host interrupt, events out and channels are all distinct types: they cannot
 //! be misused or inadvertently switched in function calls. A related benefit is that the interrupt
 //! management API is very self-explanatory.
-//! 
+//!
 //! Event handling is one of the few places where prusst requires the user to be more explicit
 //! than the C prussdrv library. Indeed, the `prussdrv_pru_clear_event` function of the C driver
 //! automatically re-enables an event out after clearing the triggering system event, which may wrongly
@@ -43,17 +43,17 @@
 //!
 //! ```
 //! extern crate prusst;
-//! 
+//!
 //! use prusst::{Pruss, IntcConfig, Sysevt, Evtout};
 //! use std::fs::File;
-//! 
+//!
 //! fn main() {
 //!     // Configure and get a view of the PRU subsystem.
 //!     let mut pruss = Pruss::new(&IntcConfig::new_populated()).unwrap();
 //!     
 //!     // Get a handle to an event out before it is triggered.
 //!     let irq = pruss.intc.register_irq(Evtout::E0);
-//! 
+//!
 //!     // Open, load and run a PRU binary.
 //!     let mut file = File::open("hello.bin").unwrap();
 //!     unsafe { pruss.pru0.load_code(&mut file).unwrap().run(); }
@@ -63,7 +63,7 @@
 //!     
 //!     // Clear the triggering interrupt.
 //!     pruss.intc.clear_sysevt(Sysevt::S19);
-//! 
+//!
 //!     // Do nothing: the `pruss` destructor will stop any running code and release ressources.
 //!     println!("We are done...");
 //! }
@@ -89,19 +89,13 @@ use std::mem;
 use std::ops::{BitOrAssign, Shl};
 use std::ptr;
 use std::result;
-use std::sync::atomic::{AtomicBool, Ordering, ATOMIC_BOOL_INIT, compiler_fence};
-
-
+use std::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
 // A flag making sure that only one instance of the PRU subsystem is instantiated at a time.
-static PRUSS_IS_INSTANTIATED: AtomicBool = ATOMIC_BOOL_INIT;
-
-
+static PRUSS_IS_INSTANTIATED: AtomicBool = AtomicBool::new(false);
 
 /// Result type for the PRU subsystem.
 pub type Result<T> = result::Result<T, Error>;
-
-
 
 /// Main interface to the PRU subsystem.
 pub struct Pruss<'a> {
@@ -136,32 +130,34 @@ impl<'a> Pruss<'a> {
 
         // Handy function to read the size of system devices.
         fn memsize(path: &str) -> io::Result<usize> {
-            let mut f = try!(File::open(path));
+            let mut f = File::open(path)?;
             let mut buffer = String::new();
-            try!(f.read_to_string(&mut buffer));
+            f.read_to_string(&mut buffer)?;
             Ok(usize::from_str_radix(&buffer[2..].trim(), 16).unwrap())
         };
 
         // Create memory mapped devices.
-        let file = try!(SyncFile::new(PRUSS_DEVICE_PATH));
-        let prumem_size = try!(memsize(UIO_PRUMEM_SIZE_PATH));
-        let hostmem_size = try!(memsize(UIO_HOSTMEM_SIZE_PATH));
-        let prumap = try!(MemMap::new(file.fd, prumem_size, 0));
-        let hostmap = try!(MemMap::new(file.fd, hostmem_size, 1));
+        let file = SyncFile::new(PRUSS_DEVICE_PATH)?;
+        let prumem_size = memsize(UIO_PRUMEM_SIZE_PATH)?;
+        let hostmem_size = memsize(UIO_HOSTMEM_SIZE_PATH)?;
+        let prumap = MemMap::new(file.fd, prumem_size, 0)?;
+        let hostmap = MemMap::new(file.fd, hostmem_size, 1)?;
 
         // Create and initialize the interrupt controller.
         let mut intc = Intc::new(unsafe { prumap.base.offset(INTC_OFFSET as isize) as *mut u32 });
         intc.map_interrupts(intc_config);
 
         // Create the PRU code loaders.
-        let pru0 =
-            PruLoader::new(unsafe { prumap.base.offset(PRU0CTRL_OFFSET as isize) as *mut u32 },
-                           unsafe { prumap.base.offset(IRAM0_OFFSET as isize) },
-                           IRAM0_SIZE);
-        let pru1 =
-            PruLoader::new(unsafe { prumap.base.offset(PRU1CTRL_OFFSET as isize) as *mut u32 },
-                           unsafe { prumap.base.offset(IRAM1_OFFSET as isize) },
-                           IRAM1_SIZE);
+        let pru0 = PruLoader::new(
+            unsafe { prumap.base.offset(PRU0CTRL_OFFSET as isize) as *mut u32 },
+            unsafe { prumap.base.offset(IRAM0_OFFSET as isize) },
+            IRAM0_SIZE,
+        );
+        let pru1 = PruLoader::new(
+            unsafe { prumap.base.offset(PRU1CTRL_OFFSET as isize) as *mut u32 },
+            unsafe { prumap.base.offset(IRAM1_OFFSET as isize) },
+            IRAM1_SIZE,
+        );
 
         // Create memory views.
         let dram0 = MemSegment::new(prumap.base, DRAM0_OFFSET, DRAM0_OFFSET + DRAM0_SIZE);
@@ -199,8 +195,6 @@ unsafe impl<'a> Send for Pruss<'a> {}
 
 unsafe impl<'a> Sync for Pruss<'a> {}
 
-
-
 /// The PRU interrupt controller.
 pub struct Intc {
     intc_reg: *mut u32,
@@ -229,8 +223,10 @@ impl Intc {
                 let cmrx = (m.sysevt >> 2) as isize;
                 debug_assert!(cmrx < NUM_CMRX);
                 let val = ptr::read_volatile(self.intc_reg.offset(CMR_REG + cmrx));
-                ptr::write_volatile(self.intc_reg.offset(CMR_REG + cmrx),
-                                    val | (m.channel as u32) << ((m.sysevt as u32 & 0b11) * 8));
+                ptr::write_volatile(
+                    self.intc_reg.offset(CMR_REG + cmrx),
+                    val | (m.channel as u32) << ((m.sysevt as u32 & 0b11) * 8),
+                );
             }
 
             // Clear all host map registers and assign channels to hosts.
@@ -241,8 +237,10 @@ impl Intc {
                 let hmrx = (m.channel >> 2) as isize;
                 debug_assert!(hmrx < NUM_HMRX);
                 let val = ptr::read_volatile(self.intc_reg.offset(HMR_REG + hmrx));
-                ptr::write_volatile(self.intc_reg.offset(HMR_REG + hmrx),
-                                    val | (m.host as u32) << ((m.channel as u32 & 0b11) * 8));
+                ptr::write_volatile(
+                    self.intc_reg.offset(HMR_REG + hmrx),
+                    val | (m.host as u32) << ((m.channel as u32 & 0b11) * 8),
+                );
             }
 
             // Set the type of system interrupts to pulse.
@@ -253,8 +251,8 @@ impl Intc {
             let (mut mask1, mut mask2) = (0u32, 0u32);
             for se in &interrupts.sysevt_enable {
                 match *se {
-                    0...31 => mask1 |= 1u32 << se,
-                    32...63 => mask2 |= 1u32 << (se - 32),
+                    0..=31 => mask1 |= 1u32 << se,
+                    32..=63 => mask2 |= 1u32 << (se - 32),
                     _ => unreachable!(),
                 };
             }
@@ -270,15 +268,15 @@ impl Intc {
             ptr::write_volatile(self.intc_reg.offset(GER_REG), 0x1);
         }
     }
-    
+
     /// Triggers a system event.
     pub fn send_sysevt(&self, sysevt: Sysevt) {
         unsafe {
             match sysevt as u8 {
-                se @ 0...31 => ptr::write_volatile(self.intc_reg.offset(SRSR1_REG),
-                                                   1u32 << se),
-                se @ 32...63 => ptr::write_volatile(self.intc_reg.offset(SRSR2_REG),
-                                                    1u32 << (se - 32)),
+                se @ 0..=31 => ptr::write_volatile(self.intc_reg.offset(SRSR1_REG), 1u32 << se),
+                se @ 32..=63 => {
+                    ptr::write_volatile(self.intc_reg.offset(SRSR2_REG), 1u32 << (se - 32))
+                }
                 _ => unreachable!(),
             };
         }
@@ -294,14 +292,14 @@ impl Intc {
     /// Enables a system event.
     pub fn enable_sysevt(&self, sysevt: Sysevt) {
         unsafe {
-            ptr::write_volatile(self.intc_reg.offset(EISR_REG), sysevt as u32 );
+            ptr::write_volatile(self.intc_reg.offset(EISR_REG), sysevt as u32);
         }
     }
 
     /// Disables a system event.
     pub fn disable_sysevt(&self, sysevt: Sysevt) {
         unsafe {
-            ptr::write_volatile(self.intc_reg.offset(EICR_REG), sysevt as u32 );
+            ptr::write_volatile(self.intc_reg.offset(EICR_REG), sysevt as u32);
         }
     }
 
@@ -312,7 +310,7 @@ impl Intc {
     pub fn enable_host<T: Into<Host>>(&self, host: T) {
         let host: Host = host.into();
         unsafe {
-            ptr::write_volatile(self.intc_reg.offset(HIEISR_REG), host as u32 );
+            ptr::write_volatile(self.intc_reg.offset(HIEISR_REG), host as u32);
         }
     }
 
@@ -320,7 +318,7 @@ impl Intc {
     pub fn disable_host<T: Into<Host>>(&self, host: T) {
         let host: Host = host.into();
         unsafe {
-            ptr::write_volatile(self.intc_reg.offset(HIDISR_REG), host as u32 );
+            ptr::write_volatile(self.intc_reg.offset(HIDISR_REG), host as u32);
         }
     }
 
@@ -338,8 +336,6 @@ impl Intc {
     }
 }
 
-
-
 /// PRU instruction code loader.
 pub struct PruLoader {
     pructrl_reg: *mut u32,
@@ -349,7 +345,6 @@ pub struct PruLoader {
 
 impl PruLoader {
     fn new(pructrl_reg: *mut u32, iram_base: *mut u8, iram_size: usize) -> PruLoader {
-
         PruLoader {
             pructrl_reg: pructrl_reg,
             iram_base: iram_base,
@@ -375,15 +370,14 @@ impl PruLoader {
         // Invoke a soft reset of the PRU to make sure no code is currently running.
         self.reset();
         // Write the code to the instruction RAM.
-        let n: usize = try!(code.read( unsafe {
-            std::slice::from_raw_parts_mut(self.iram_base, self.iram_size)
-        }));
+        let n: usize =
+            code.read(unsafe { std::slice::from_raw_parts_mut(self.iram_base, self.iram_size) })?;
         // Make sure the whole buffer was read, otherwise return an InvalidInput error kind.
         match n {
-            0 => {
-                Err(io::Error::new(io::ErrorKind::InvalidInput,
-                                   "size of PRU code exceeding instruction RAM capacity"))
-            }
+            0 => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "size of PRU code exceeding instruction RAM capacity",
+            )),
             _ => {
                 // Introduce a fence to ensure that IRAM writes are not reordered past the
                 // call to PruCode::run().
@@ -403,8 +397,6 @@ impl PruLoader {
         }
     }
 }
-
-
 
 /// View of a contiguous memory segment.
 ///
@@ -431,7 +423,7 @@ impl<'a> MemSegment<'a> {
             _memory_marker: PhantomData,
         }
     }
-    
+
     /// Allocates an object at the beginning of the segment.
     ///
     /// # Panics
@@ -487,26 +479,26 @@ impl<'a> MemSegment<'a> {
     /// the second segment hence created will return 0x00001000 and not 0x00000000.
     pub fn split_at(&mut self, position: usize) -> (MemSegment, MemSegment) {
         assert!(position >= self.from && position <= self.to);
-        (MemSegment {
-            base: self.base,
-            from: self.from,
-            to: position,
-            _memory_marker: PhantomData,
-        },
-         MemSegment {
-            base: self.base,
-            from: position,
-            to: self.to,
-            _memory_marker: PhantomData,
-        })
+        (
+            MemSegment {
+                base: self.base,
+                from: self.from,
+                to: position,
+                _memory_marker: PhantomData,
+            },
+            MemSegment {
+                base: self.base,
+                from: position,
+                to: self.to,
+                _memory_marker: PhantomData,
+            },
+        )
     }
 }
 
 unsafe impl<'a> Send for MemSegment<'a> {}
 
 unsafe impl<'a> Sync for MemSegment<'a> {}
-
-
 
 /// PRU interrupt controller configuration.
 ///
@@ -568,16 +560,20 @@ impl IntcConfig {
     ///
     pub fn new_populated() -> IntcConfig {
         let mut config_data = Self::new_empty();
-        config_data.map_sysevts_to_channels(&[(Sysevt::S17, Channel::C1),
-                                            (Sysevt::S18, Channel::C0),
-                                            (Sysevt::S19, Channel::C2),
-                                            (Sysevt::S20, Channel::C3),
-                                            (Sysevt::S21, Channel::C0),
-                                            (Sysevt::S22, Channel::C1)]);
-        config_data.map_channels_to_hosts(&[(Channel::C0, Host::Pru0),
-                                          (Channel::C1, Host::Pru1),
-                                          (Channel::C2, Host::Evtout0),
-                                          (Channel::C3, Host::Evtout1)]);
+        config_data.map_sysevts_to_channels(&[
+            (Sysevt::S17, Channel::C1),
+            (Sysevt::S18, Channel::C0),
+            (Sysevt::S19, Channel::C2),
+            (Sysevt::S20, Channel::C3),
+            (Sysevt::S21, Channel::C0),
+            (Sysevt::S22, Channel::C1),
+        ]);
+        config_data.map_channels_to_hosts(&[
+            (Channel::C0, Host::Pru0),
+            (Channel::C1, Host::Pru1),
+            (Channel::C2, Host::Evtout0),
+            (Channel::C3, Host::Evtout1),
+        ]);
         config_data.auto_enable_sysevts();
         config_data.auto_enable_hosts();
 
@@ -591,7 +587,8 @@ impl IntcConfig {
     /// This will panic if a system event is enabled several times.
     pub fn enable_sysevts(&mut self, sysevts: &[Sysevt]) {
         let mut bitfield = BitField64::new(NUM_SYSEVTS);
-        self.sysevt_enable = sysevts.iter()
+        self.sysevt_enable = sysevts
+            .iter()
             .map(|&sysevt| {
                 assert!(bitfield.try_set(sysevt as u8));
                 sysevt as u8
@@ -606,7 +603,8 @@ impl IntcConfig {
     /// This will panic if a host interrupt is enabled several times.
     pub fn enable_hosts(&mut self, hosts: &[Host]) {
         let mut bitfield = BitField32::new(NUM_HOSTS);
-        self.host_enable = hosts.iter()
+        self.host_enable = hosts
+            .iter()
             .map(|&host| {
                 assert!(bitfield.try_set(host as u8));
                 host as u8
@@ -616,7 +614,8 @@ impl IntcConfig {
 
     /// Automatically enables system events that are already assigned to a channel.
     pub fn auto_enable_sysevts(&mut self) {
-        self.sysevt_enable = self.sysevt_to_channel_map
+        self.sysevt_enable = self
+            .sysevt_to_channel_map
             .iter()
             .map(|sysevt_to_channel| sysevt_to_channel.sysevt)
             .collect();
@@ -624,7 +623,8 @@ impl IntcConfig {
 
     /// Automatically enables host interrupts that are already mapped to a channel.
     pub fn auto_enable_hosts(&mut self) {
-        self.host_enable = self.channel_to_host_map
+        self.host_enable = self
+            .channel_to_host_map
             .iter()
             .map(|channel_to_host| channel_to_host.host)
             .collect()
@@ -639,7 +639,8 @@ impl IntcConfig {
     /// This will panic if a system event is mapped to several channels simultaneously.
     pub fn map_sysevts_to_channels(&mut self, scmap: &[(Sysevt, Channel)]) {
         let mut bitfield = BitField64::new(NUM_SYSEVTS);
-        self.sysevt_to_channel_map = scmap.iter()
+        self.sysevt_to_channel_map = scmap
+            .iter()
             .map(|&(s, c)| {
                 assert!(bitfield.try_set(s as u8));
                 SysevtToChannel {
@@ -660,7 +661,8 @@ impl IntcConfig {
     /// This will panic if a channel is mapped to several hosts.
     pub fn map_channels_to_hosts(&mut self, chmap: &[(Channel, Host)]) {
         let mut bitfield = BitField32::new(NUM_CHANNELS);
-        self.channel_to_host_map = chmap.iter()
+        self.channel_to_host_map = chmap
+            .iter()
             .map(|&(c, h)| {
                 assert!(bitfield.try_set(c as u8));
                 ChannelToHost {
@@ -671,8 +673,6 @@ impl IntcConfig {
             .collect();
     }
 }
-
-
 
 /// Synchronization primitive that can be used to wait for an event out.
 pub struct EvtoutIrq {
@@ -706,8 +706,6 @@ impl EvtoutIrq {
         self.event
     }
 }
-
-
 
 /// Handle to a binary code loaded in the PRU.
 pub struct PruCode<'a> {
@@ -764,8 +762,6 @@ unsafe impl<'a> Send for PruCode<'a> {}
 
 unsafe impl<'a> Sync for PruCode<'a> {}
 
-
-
 /// Connection from system event to channel
 #[derive(Copy, Clone)]
 struct SysevtToChannel {
@@ -773,16 +769,12 @@ struct SysevtToChannel {
     channel: u8,
 }
 
-
-
 /// Connection from channel to host
 #[derive(Copy, Clone)]
 struct ChannelToHost {
     channel: u8,
     host: u8,
 }
-
-
 
 /// A read-write file with synchronized I/O.
 struct SyncFile {
@@ -792,8 +784,10 @@ struct SyncFile {
 impl SyncFile {
     fn new(path: &str) -> io::Result<SyncFile> {
         let fd = unsafe {
-            libc::open(CString::new(path).unwrap().as_ptr(),
-                       libc::O_RDWR | libc::O_SYNC)
+            libc::open(
+                CString::new(path).unwrap().as_ptr(),
+                libc::O_RDWR | libc::O_SYNC,
+            )
         };
         match fd {
             err if err < 0 => Err(io::Error::from_raw_os_error(err as i32)),
@@ -810,8 +804,6 @@ impl Drop for SyncFile {
     }
 }
 
-
-
 /// Memory-mapped file.
 struct MemMap {
     base: *mut u8,
@@ -821,12 +813,14 @@ struct MemMap {
 impl MemMap {
     fn new(fd: libc::c_int, size: usize, page: isize) -> io::Result<MemMap> {
         unsafe {
-            let base = libc::mmap(ptr::null_mut(),
-                                  size as libc::size_t,
-                                  libc::PROT_READ | libc::PROT_WRITE,
-                                  libc::MAP_SHARED,
-                                  fd,
-                                  (PAGE_SIZE * page) as libc::off_t);
+            let base = libc::mmap(
+                ptr::null_mut(),
+                size as libc::size_t,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                (PAGE_SIZE * page) as libc::off_t,
+            );
             if base == libc::MAP_FAILED {
                 Err(io::Error::last_os_error())
             } else {
@@ -846,8 +840,6 @@ impl Drop for MemMap {
         }
     }
 }
-
-
 
 /// A bit field based on an unsigned type with a width of 256 at most.
 #[derive(Copy, Clone)]
