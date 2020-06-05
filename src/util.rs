@@ -1,8 +1,6 @@
 //! Useful objects and functions.
 
-use std::ptr::{write_volatile, read_volatile};
-
-
+use std::ptr::{read_volatile, write_volatile};
 
 /// A convenient zero-overhead wrapper for volatile fields that implement `Copy` and `Clone`.
 ///
@@ -14,7 +12,7 @@ use std::ptr::{write_volatile, read_volatile};
 /// changed by another process, this may wrongly lead the user into believing that volatile
 /// values can be used used for inter-thread communication (see A. D. Robinson's essay:
 /// "Volatile: Almost Useless for Multi-Threaded Programming").
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 #[repr(C)]
 pub struct VolatileCell<T> {
     value: T,
@@ -23,17 +21,13 @@ pub struct VolatileCell<T> {
 impl<T> VolatileCell<T> {
     /// Creates a new `VolatileCell` containing the given value.
     pub fn new(value: T) -> VolatileCell<T> {
-        VolatileCell {
-            value: value,
-        }
+        VolatileCell { value: value }
     }
 
     /// Returns a copy of the contained value.
     #[inline]
     pub fn get(&self) -> T {
-        unsafe {
-            read_volatile(&self.value as *const T)
-        }
+        unsafe { read_volatile(&self.value as *const T) }
     }
 
     /// Sets the contained value.
@@ -44,4 +38,3 @@ impl<T> VolatileCell<T> {
         }
     }
 }
-
