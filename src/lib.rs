@@ -70,6 +70,7 @@
 //! ```
 
 extern crate libc;
+extern crate mio;
 
 mod def;
 mod error;
@@ -87,9 +88,12 @@ use std::io::{self, Read};
 use std::marker::PhantomData;
 use std::mem;
 use std::ops::{BitOrAssign, Shl};
+use std::os::unix::io::AsRawFd;
 use std::ptr;
 use std::result;
 use std::sync::atomic::{compiler_fence, AtomicBool, Ordering};
+
+use mio::{event, unix::SourceFd, Interest, Registry, Token};
 
 // A flag making sure that only one instance of the PRU subsystem is instantiated at a time.
 static PRUSS_IS_INSTANTIATED: AtomicBool = AtomicBool::new(false);
@@ -704,6 +708,30 @@ impl EvtoutIrq {
     /// Returns the associated event out.
     pub fn get_evtout(&self) -> Evtout {
         self.event
+    }
+}
+
+impl event::Source for EvtoutIrq {
+    fn register(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        interests: Interest,
+    ) -> std::io::Result<()> {
+        SourceFd(&self.file.as_raw_fd()).register(registry, token, interests)
+    }
+
+    fn reregister(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        interests: Interest,
+    ) -> std::io::Result<()> {
+        SourceFd(&self.file.as_raw_fd()).reregister(registry, token, interests)
+    }
+
+    fn deregister(&mut self, registry: &Registry) -> std::io::Result<()> {
+        SourceFd(&self.file.as_raw_fd()).deregister(registry)
     }
 }
 
